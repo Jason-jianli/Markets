@@ -107,11 +107,24 @@ def build_cta_signal_price_matrix(model_inputs_dict):
         pieces.append(pivot_model_input(futures_df, FUTURES_SIGNAL_ASSET_MAP, "px1_clean"))
     if not fx_df.empty:
         pieces.append(pivot_model_input(fx_df, FX_SIGNAL_ASSET_MAP, "price_clean"))
-    if not pieces:
-        raise ValueError("No usable futures or FX data found in model_inputs.")
 
-    prices = pd.concat(pieces, axis=1).sort_index()
-    prices = prices.loc[:, ~prices.columns.duplicated()].ffill()
+    clean_pieces = []
+    for piece in pieces:
+        if piece.empty:
+            continue
+        piece = piece.loc[:, ~piece.columns.duplicated()].dropna(axis=1, how="all")
+        if not piece.empty:
+            clean_pieces.append(piece)
+
+    if not clean_pieces:
+        raise ValueError("No usable futures or FX price data found in model_inputs.")
+
+    if len(clean_pieces) == 1:
+        prices = clean_pieces[0].copy()
+    else:
+        prices = pd.concat(clean_pieces, axis=1, join="outer", copy=False)
+
+    prices = prices.loc[:, ~prices.columns.duplicated()].sort_index().ffill()
     return prices
 
 
