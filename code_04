@@ -1,0 +1,177 @@
+# CTA signal construction from cleaned model_inputs.
+# Run this cell after the data pipeline cell has created either:
+#   model_inputs = {"futures": futures_model_inputs, "fx": fx_model_inputs}
+# or:
+#   data_bundle["model_inputs"]
+
+TRADING_DAYS = 252
+
+SIGNAL_CONFIGS = {
+    "fast": {
+        "ewma_pairs": ((4, 16), (8, 32), (16, 64), (32, 128)),
+        "norm_window": 126,
+        "response_scale": 1.0,
+    },
+    "medium": {
+        "ewma_pairs": ((8, 32), (16, 64), (32, 128), (64, 256)),
+        "norm_window": 252,
+        "response_scale": 1.5,
+    },
+    "slow": {
+        "ewma_pairs": ((16, 64), (32, 128), (64, 256), (128, 512)),
+        "norm_window": 252,
+        "response_scale": 2.0,
+    },
+}
+
+ASSET_CLASS_SIGNAL_CONFIG = {
+    "Rates": "medium",
+    "Equity": "fast",
+    "FX": "medium",
+}
+
+# Leave this empty at first. Later, per-asset grid search can write into it.
+ASSET_SIGNAL_CONFIG_OVERRIDES = {
+    # "US10Y": {"ewma_pairs": ((4, 16), (8, 32), (16, 64), (32, 128)), "norm_window": 126, "response_scale": 1.0},
+}
+
+FUTURES_SIGNAL_ASSET_MAP = {
+    # Rates futures
+    "US2Y": "US2Y",
+    "US5Y": "US5Y",
+    "US10Y": "US10Y",
+    "US20Y": "US20Y",
+    "US30Y": "US30Y",
+    "AU10Y": "AU10Y",
+    "JP10Y": "JP10Y",
+    "EU10Y": "EU10Y",
+    "GB10Y": "GB10Y",
+
+    # Equity futures
+    "US_EQ": "SPX",
+    "AU_EQ": "ASX200",
+    "JP_EQ": "NKY225",
+    "EU_EQ": "ESTX50",
+    "GB_EQ": "FTSE100",
+}
+
+FX_SIGNAL_ASSET_MAP = {
+    "USD": "USD",
+    "AUD": "AUD",
+    "EUR": "EUR",
+    "GBP": "GBP",
+    # FX columns are currency-strength proxies. USDJPY is inverted upstream, so JPY means long JPY vs USD.
+    "JPY": "JPY",
+}
+
+SIGNAL_ASSET_CLASS = {
+    **{asset: "Rates" for asset in ["US2Y", "US5Y", "US10Y", "US20Y", "US30Y", "AU10Y", "JP10Y", "EU10Y", "GB10Y"]},
+    **{asset: "Equity" for asset in ["SPX", "ASX200", "NKY225", "ESTX50", "FTSE100"]},
+    **{asset: "FX" for asset in ["USD", "AUD", "EUR", "GBP", "JPY"]},
+}
+
+
+def get_available_model_inputs():
+    if "model_inputs" in globals():
+        return model_inputs
+    if "data_bundle" in globals() and "model_inputs" in data_bundle:
+        return data_bundle["model_inputs"]
+    raise NameError("Run the data pipeline first so model_inputs or data_bundle['model_inputs'] exists.")
+
+
+def pivot_model_input(df, asset_map, value_col):
+    required_cols = {"date", "asset_key", value_col}
+    missing_cols = required_cols - set(df.columns)
+    if missing_cols:
+        raise ValueError(f"Missing required columns for {value_col}: {sorted(missing_cols)}")
+
+    tmp = df.loc[df["asset_key"].isin(asset_map), ["date", "asset_key", value_col]].copy()
+    tmp["date"] = pd.to_datetime(tmp["date"]).dt.normalize()
+    tmp["asset"] = tmp["asset_key"].map(asset_map)
+
+    wide = (
+        tmp.pivot_table(index="date", columns="asset", values=value_col, aggfunc="last")
+        .sort_index()
+        .astype(float)
+    )
+    wide.columns.name = None
+    return wide
+
+
+def build_cta_signal_price_matrix(model_inputs_dict):
+    futures_df = model_inputs_dict.get("futures", pd.DataFrame())
+    fx_df = model_inputs_dict.get("fx", pd.DataFrame())
+
+    pieces = []
+    if not futures_df.empty:
+        pieces.append(pivot_model_input(futures_df, FUTURES_SIGNAL_ASSET_MAP, "px1_clean"))
+    if not fx_df.empty:
+        pieces.append(pivot_model_input(fx_df, FX_SIGNAL_ASSET_MAP, "price_clean"))
+    if not pieces:
+        raise ValueError("No usable futures or FX data found in model_inputs.")
+
+    prices = pd.concat(pieces, axis=1).sort_index()
+    prices = prices.loc[:, ~prices.columns.duplicated()].ffill()
+    return prices
+
+
+def get_signal_config(asset):
+    if asset in ASSET_SIGNAL_CONFIG_OVERRIDES:
+        return ASSET_SIGNAL_CONFIG_OVERRIDES[asset]
+
+    asset_class = SIGNAL_ASSET_CLASS.get(asset)
+    if asset_class is None:
+        raise KeyError(f"No asset-class mapping for {asset}. Add it to SIGNAL_ASSET_CLASS.")
+
+    config_name = ASSET_CLASS_SIGNAL_CONFIG.get(asset_class, "medium")
+    return SIGNAL_CONFIGS[config_name]
+
+
+def momentum_signal(price_df, ewma_pairs, norm_window, response_scale):
+    ret_vol = (
+        price_df.pct_change()
+        .rolling(norm_window, min_periods=max(40, norm_window // 2))
+        .std()
+        .clip(lower=1e-6)
+    )
+
+    trend_parts = []
+    for short_span, long_span in ewma_pairs:
+        fast = price_df.ewm(span=short_span, adjust=False, min_periods=short_span).mean()
+        slow = price_df.ewm(span=long_span, adjust=False, min_periods=long_span).mean()
+        spread = fast - slow
+
+        # UBS-style dimensionless trend proxy: price spread divided by price volatility.
+        denom = price_df * ret_vol * np.sqrt(long_span)
+        trend_parts.append(spread / denom)
+
+    trend_stack = pd.concat(trend_parts, axis=1, keys=range(len(trend_parts)))
+    trend = trend_stack.T.groupby(level=1).mean().T
+    signal = np.tanh(trend / response_scale).clip(-1, 1)
+    signal.columns = price_df.columns
+    return signal
+
+
+def build_cta_signal_matrix(price_df):
+    signal_parts = []
+    for asset in price_df.columns:
+        signal_parts.append(momentum_signal(price_df[[asset]], **get_signal_config(asset)))
+
+    signals = pd.concat(signal_parts, axis=1)
+    return signals.reindex(columns=price_df.columns)
+
+
+model_inputs_for_signal = get_available_model_inputs()
+cta_signal_prices = build_cta_signal_price_matrix(model_inputs_for_signal)
+cta_signals = build_cta_signal_matrix(cta_signal_prices)
+
+signal_summary = pd.DataFrame({
+    "asset_class": pd.Series(SIGNAL_ASSET_CLASS).reindex(cta_signals.columns),
+    "latest_price": cta_signal_prices.ffill().iloc[-1],
+    "latest_signal": cta_signals.ffill().iloc[-1],
+    "first_date": cta_signal_prices.apply(lambda s: s.first_valid_index()),
+    "last_date": cta_signal_prices.apply(lambda s: s.last_valid_index()),
+})
+
+display(signal_summary.sort_values(["asset_class", "latest_signal"]))
+display(cta_signals.tail())
