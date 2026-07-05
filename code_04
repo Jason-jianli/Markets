@@ -1,8 +1,8 @@
-# CTA signal construction from cleaned model_inputs.
-# Run this cell after the data pipeline cell has created either:
-#   model_inputs = {"futures": futures_model_inputs, "fx": fx_model_inputs}
-# or:
-#   data_bundle["model_inputs"]
+# Cell 3 - CTA signal construction.
+# Input:
+#   model_inputs from the real pipeline or mock cell
+# Output:
+#   cta_signal_prices, cta_signals, signal_summary
 
 TRADING_DAYS = 252
 
@@ -31,9 +31,11 @@ ASSET_CLASS_SIGNAL_CONFIG = {
 }
 
 # Leave this empty at first. Later, per-asset grid search can write into it.
-ASSET_SIGNAL_CONFIG_OVERRIDES = {
-    # "US10Y": {"ewma_pairs": ((4, 16), (8, 32), (16, 64), (32, 128)), "norm_window": 126, "response_scale": 1.0},
-}
+# Keep existing values if this cell is rerun after the grid-search cell.
+if "ASSET_SIGNAL_CONFIG_OVERRIDES" not in globals():
+    ASSET_SIGNAL_CONFIG_OVERRIDES = {
+        # "US10Y": {"ewma_pairs": ((4, 16), (8, 32), (16, 64), (32, 128)), "norm_window": 126, "response_scale": 1.0},
+    }
 
 FUTURES_SIGNAL_ASSET_MAP = {
     # Rates futures
@@ -122,7 +124,7 @@ def build_cta_signal_price_matrix(model_inputs_dict):
     if len(clean_pieces) == 1:
         prices = clean_pieces[0].copy()
     else:
-        prices = pd.concat(clean_pieces, axis=1, join="outer", copy=False)
+        prices = pd.concat(clean_pieces, axis=1, join="outer", sort=False)
 
     prices = prices.loc[:, ~prices.columns.duplicated()].sort_index().ffill()
     return prices
@@ -188,3 +190,741 @@ signal_summary = pd.DataFrame({
 
 display(signal_summary.sort_values(["asset_class", "latest_signal"]))
 display(cta_signals.tail())
+
+# Cell 4 - Per-asset signal grid search.
+# Trader-oriented objective:
+#   When the model gives an extreme signal, does the asset move in that direction
+#   over the next 10 business days?
+# Output:
+#   asset_signal_grid_results, best_signal_table, signal_grid_robustness
+#   ASSET_SIGNAL_CONFIG_OVERRIDES, updated cta_signals
+
+RUN_SIGNAL_GRID_SEARCH = True
+
+# quick: smoke test, useful while editing
+# balanced: default research mode, usually much faster than full
+# full: broad grid for deeper overnight / patient runs
+GRID_SEARCH_MODE = "full"
+
+TRAIN_FRACTION = 0.70
+MIN_OBSERVATIONS_FOR_GRID = 756
+MIN_TRAIN_EXTREME_OBS = 40
+MIN_TEST_EXTREME_OBS = 20
+MIN_FULL_EXTREME_OBS = MIN_TRAIN_EXTREME_OBS + MIN_TEST_EXTREME_OBS
+TARGET_EXTREME_COVERAGE = 0.20
+FORWARD_HORIZON_DAYS = 10
+
+PAIRSET_GRID = {
+    "very_fast": ((3, 12), (5, 20), (10, 40), (20, 80)),
+    "fast": ((4, 16), (8, 32), (16, 64), (32, 128)),
+    "medium": ((8, 32), (16, 64), (32, 128), (64, 256)),
+    "slow": ((16, 64), (32, 128), (64, 256), (128, 512)),
+    "very_slow": ((32, 128), (64, 256), (96, 384), (128, 512)),
+}
+
+
+def make_parameter_grid(mode):
+    if mode == "quick":
+        return {
+            "pairset": ["fast", "medium", "slow"],
+            "norm_window": [126, 252],
+            "response_scale": [0.75, 1.00, 1.50],
+            "extreme_threshold": [0.50, 0.60, 0.70],
+            "forward_horizon": [FORWARD_HORIZON_DAYS],
+        }
+
+    if mode == "balanced":
+        return {
+            "pairset": ["very_fast", "fast", "medium", "slow"],
+            "norm_window": [126, 252],
+            "response_scale": [0.75, 1.00, 1.25, 1.50],
+            "extreme_threshold": [0.50, 0.60, 0.70],
+            "forward_horizon": [FORWARD_HORIZON_DAYS],
+        }
+
+    if mode == "full":
+        return {
+            "pairset": ["very_fast", "fast", "medium", "slow", "very_slow"],
+            "norm_window": [63, 126, 252, 378],
+            "response_scale": [0.50, 0.75, 1.00, 1.25, 1.50, 2.00],
+            "extreme_threshold": [0.50, 0.60, 0.70],
+            "forward_horizon": [FORWARD_HORIZON_DAYS],
+        }
+
+    raise ValueError(f"Unknown GRID_SEARCH_MODE: {mode}")
+
+
+PARAMETER_GRID = make_parameter_grid(GRID_SEARCH_MODE)
+
+
+def forward_return(price, horizon):
+    return price.shift(-horizon) / price - 1.0
+
+
+def score_extreme_block(signal, fwd_ret, threshold, prefix):
+    data = pd.DataFrame({
+        "signal": signal,
+        "forward_return": fwd_ret,
+    }).dropna()
+
+    if data.empty:
+        return {
+            f"{prefix}_extreme_count": 0,
+            f"{prefix}_coverage": 0.0,
+            f"{prefix}_hit_rate": np.nan,
+            f"{prefix}_mean_signed_return": np.nan,
+            f"{prefix}_t_stat": np.nan,
+            f"{prefix}_sample_ok": False,
+            f"{prefix}_score": -np.inf,
+        }
+
+    extreme = data["signal"].abs() >= threshold
+    extreme_data = data.loc[extreme].copy()
+    coverage = len(extreme_data) / len(data)
+
+    if extreme_data.empty:
+        hit_rate = np.nan
+        mean_signed = np.nan
+        t_stat = np.nan
+    else:
+        signed_forward = np.sign(extreme_data["signal"]) * extreme_data["forward_return"]
+        hit_rate = (signed_forward > 0).mean()
+        mean_signed = signed_forward.mean()
+        std_signed = signed_forward.std()
+        t_stat = np.nan if std_signed == 0 or pd.isna(std_signed) else mean_signed / (std_signed / np.sqrt(len(signed_forward)))
+
+    min_obs_by_prefix = {
+        "train": MIN_TRAIN_EXTREME_OBS,
+        "test": MIN_TEST_EXTREME_OBS,
+        "full": MIN_FULL_EXTREME_OBS,
+    }
+    enough_obs = len(extreme_data) >= min_obs_by_prefix.get(prefix, 1)
+    if enough_obs and pd.notna(mean_signed) and pd.notna(hit_rate):
+        hit_edge = hit_rate - 0.5
+        coverage_penalty = abs(coverage - TARGET_EXTREME_COVERAGE)
+        score = (
+            100.0 * mean_signed
+            + 0.75 * np.nan_to_num(t_stat, nan=0.0)
+            + 3.0 * hit_edge
+            - 1.5 * coverage_penalty
+        )
+    else:
+        score = -np.inf
+
+    return {
+        f"{prefix}_extreme_count": len(extreme_data),
+        f"{prefix}_coverage": coverage,
+        f"{prefix}_hit_rate": hit_rate,
+        f"{prefix}_mean_signed_return": mean_signed,
+        f"{prefix}_t_stat": t_stat,
+        f"{prefix}_sample_ok": enough_obs,
+        f"{prefix}_score": score,
+    }
+
+
+def evaluate_extreme_signal_config(price, signal, threshold, horizon, train_fraction=TRAIN_FRACTION):
+    price = pd.Series(price).dropna()
+    signal = pd.Series(signal).reindex(price.index)
+
+    fwd_ret = forward_return(price, horizon)
+    data = pd.DataFrame({"signal": signal, "forward_return": fwd_ret}).dropna()
+    if len(data) < MIN_OBSERVATIONS_FOR_GRID:
+        return {}
+
+    split = int(len(data) * train_fraction)
+    train = data.iloc[:split]
+    test = data.iloc[split:]
+
+    metrics = {}
+    metrics.update(score_extreme_block(train["signal"], train["forward_return"], threshold, "train"))
+    metrics.update(score_extreme_block(test["signal"], test["forward_return"], threshold, "test"))
+    metrics.update(score_extreme_block(data["signal"], data["forward_return"], threshold, "full"))
+    metrics["train_start"] = train.index[0]
+    metrics["train_end"] = train.index[-1]
+    metrics["test_start"] = test.index[0]
+    metrics["test_end"] = test.index[-1]
+    return metrics
+
+
+def run_signal_parameter_grid(price_df):
+    rows = []
+    for asset in price_df.columns:
+        price = price_df[asset].dropna()
+        if len(price) < MIN_OBSERVATIONS_FOR_GRID:
+            continue
+
+        for pairset_name in PARAMETER_GRID["pairset"]:
+            for norm_window in PARAMETER_GRID["norm_window"]:
+                for response_scale in PARAMETER_GRID["response_scale"]:
+                    config = {
+                        "ewma_pairs": PAIRSET_GRID[pairset_name],
+                        "norm_window": norm_window,
+                        "response_scale": response_scale,
+                    }
+                    signal = momentum_signal(price.to_frame(asset), **config).iloc[:, 0]
+
+                    for threshold in PARAMETER_GRID["extreme_threshold"]:
+                        for horizon in PARAMETER_GRID["forward_horizon"]:
+                            metrics = evaluate_extreme_signal_config(price, signal, threshold, horizon)
+                            if not metrics:
+                                continue
+                            rows.append({
+                                "asset": asset,
+                                "asset_class": SIGNAL_ASSET_CLASS.get(asset),
+                                "pairset": pairset_name,
+                                "ewma_pairs": PAIRSET_GRID[pairset_name],
+                                "norm_window": norm_window,
+                                "response_scale": response_scale,
+                                "extreme_threshold": threshold,
+                                "forward_horizon": horizon,
+                                **metrics,
+                            })
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values(["asset", "train_score"], ascending=[True, False])
+
+
+def add_grid_selection_flags(grid_results):
+    if grid_results.empty:
+        return grid_results.copy()
+
+    out = grid_results.copy()
+    out["sample_ok"] = (
+        out["train_extreme_count"].ge(MIN_TRAIN_EXTREME_OBS)
+        & out["test_extreme_count"].ge(MIN_TEST_EXTREME_OBS)
+        & np.isfinite(out["train_score"])
+    )
+    out["selection_score"] = np.where(out["sample_ok"], out["train_score"], -np.inf)
+    return out
+
+
+def select_best_signal_table(grid_results):
+    if grid_results.empty:
+        return pd.DataFrame()
+
+    candidates = add_grid_selection_flags(grid_results)
+    return (
+        candidates
+        .sort_values(
+            ["asset", "sample_ok", "selection_score", "train_score"],
+            ascending=[True, False, False, False],
+        )
+        .groupby("asset", as_index=False)
+        .head(1)
+        .set_index("asset")
+        .sort_values(["asset_class", "sample_ok", "train_score"], ascending=[True, False, False])
+    )
+
+
+def build_grid_robustness_table(grid_results, top_n=5):
+    if grid_results.empty:
+        return pd.DataFrame()
+
+    grid_results = add_grid_selection_flags(grid_results)
+
+    top = (
+        grid_results
+        .sort_values(
+            ["asset", "sample_ok", "selection_score", "train_score"],
+            ascending=[True, False, False, False],
+        )
+        .groupby("asset", as_index=False)
+        .head(top_n)
+    )
+
+    return (
+        top
+        .groupby("asset")
+        .agg(
+            asset_class=("asset_class", "first"),
+            top_pairsets=("pairset", lambda x: ", ".join(pd.Series(x).astype(str).unique())),
+            top_norm_windows=("norm_window", lambda x: ", ".join(map(str, sorted(pd.Series(x).unique())))),
+            top_response_scales=("response_scale", lambda x: ", ".join(map(str, sorted(pd.Series(x).unique())))),
+            top_thresholds=("extreme_threshold", lambda x: ", ".join(map(str, sorted(pd.Series(x).unique())))),
+            top_horizons=("forward_horizon", lambda x: ", ".join(map(str, sorted(pd.Series(x).unique())))),
+            sample_ok_count=("sample_ok", "sum"),
+            avg_top_train_score=("train_score", "mean"),
+            avg_top_test_score=("test_score", "mean"),
+        )
+        .sort_values(["asset_class", "avg_top_train_score"], ascending=[True, False])
+    )
+
+
+if RUN_SIGNAL_GRID_SEARCH:
+    grid_candidates_per_asset = (
+        len(PARAMETER_GRID["pairset"])
+        * len(PARAMETER_GRID["norm_window"])
+        * len(PARAMETER_GRID["response_scale"])
+        * len(PARAMETER_GRID["extreme_threshold"])
+        * len(PARAMETER_GRID["forward_horizon"])
+    )
+    print(
+        f"Running {GRID_SEARCH_MODE} signal grid: "
+        f"{grid_candidates_per_asset} candidates per asset, "
+        f"about {grid_candidates_per_asset * cta_signal_prices.shape[1]:,} total rows."
+    )
+
+    asset_signal_grid_results = run_signal_parameter_grid(cta_signal_prices)
+
+    asset_signal_grid_results = add_grid_selection_flags(asset_signal_grid_results)
+    best_signal_table = select_best_signal_table(asset_signal_grid_results)
+
+    ASSET_SIGNAL_CONFIG_OVERRIDES = {
+        asset: {
+            "ewma_pairs": row["ewma_pairs"],
+            "norm_window": int(row["norm_window"]),
+            "response_scale": float(row["response_scale"]),
+        }
+        for asset, row in best_signal_table.iterrows()
+    }
+
+    # These are not needed for continuous positioning, but useful for trader alerts:
+    # "this signal is extreme under the selected calibration."
+    ASSET_SIGNAL_ALERT_CONFIG = {
+        asset: {
+            "extreme_threshold": float(row["extreme_threshold"]),
+            "forward_horizon": int(row["forward_horizon"]),
+        }
+        for asset, row in best_signal_table.iterrows()
+    }
+
+    # Recompute signals using selected per-asset configs. Downstream positioning uses this updated cta_signals.
+    cta_signals = build_cta_signal_matrix(cta_signal_prices)
+    signal_summary = pd.DataFrame({
+        "asset_class": pd.Series(SIGNAL_ASSET_CLASS).reindex(cta_signals.columns),
+        "latest_price": cta_signal_prices.ffill().iloc[-1],
+        "latest_signal": cta_signals.ffill().iloc[-1],
+        "first_date": cta_signal_prices.apply(lambda s: s.first_valid_index()),
+        "last_date": cta_signal_prices.apply(lambda s: s.last_valid_index()),
+    })
+
+    signal_grid_robustness = build_grid_robustness_table(asset_signal_grid_results)
+
+    grid_display_cols = [
+        "asset_class", "pairset", "norm_window", "response_scale",
+        "extreme_threshold", "forward_horizon", "sample_ok",
+        "train_score", "test_score", "full_score",
+        "train_extreme_count", "test_extreme_count",
+        "train_coverage", "test_coverage",
+        "train_sample_ok", "test_sample_ok",
+        "train_hit_rate", "test_hit_rate",
+        "train_mean_signed_return", "test_mean_signed_return",
+        "train_t_stat", "test_t_stat",
+    ]
+    display(best_signal_table[grid_display_cols])
+    display(signal_grid_robustness)
+else:
+    asset_signal_grid_results = pd.DataFrame()
+    best_signal_table = pd.DataFrame()
+    signal_grid_robustness = pd.DataFrame()
+    print("Signal grid search skipped.")
+
+# Cell 5 - Current CTA positioning.
+# Inputs:
+#   model_inputs, cta_signal_prices, cta_signals
+# Output:
+#   cta_adv, cta_liquidity_factors, cta_liquidity_diagnostics
+#   cta_positions, cta_current_positioning
+
+CURRENT_VOL_WINDOW = 63       # about 3 months
+PORTFOLIO_VOL_WINDOW = 756    # about 3 years
+FLOW_LOOKBACK_DAYS = 10       # about 2 weeks
+TARGET_PORTFOLIO_VOL = 0.10
+
+ASSET_CLASS_WEIGHTS = {
+    "Rates": 0.45,
+    "Equity": 0.35,
+    "FX": 0.20,
+}
+
+FX_LIQUIDITY_FACTORS = {
+    # FX has no volume/OI in our input pipeline, so this remains an assumption.
+    "USD": 7,
+    "AUD": 5,
+    "EUR": 8,
+    "GBP": 6,
+    "JPY": 8,
+}
+
+LIQUIDITY_SCORE_WEIGHTS = {
+    "adv": 0.70,
+    "oi": 0.30,
+}
+
+# UBS Q-Series Figure 62/63 rates-futures assumptions.
+# We keep this as a sanity-check anchor, not as the default model input.
+UBS_RATES_LIQUIDITY_FACTORS = {
+    "US2Y": 1,
+    "US5Y": 4,
+    "US10Y": 8,
+    "US20Y": 4,
+    "US30Y": 4,
+    "AU10Y": 2,
+    "JP10Y": 4,
+    "EU10Y": 8,
+    "GB10Y": 4,
+}
+
+# These constants calibrate model output into the reporting unit.
+# Rates uses a bp-vol denominator, matching UBS Q-Series Figure 63
+# ("Volatility (t, in bps)" and "Position (t, $DV01 mn)"). Equity/FX use
+# decimal price volatility and report USD mn notional.
+UNIT_SCALERS = {
+    "Rates": 500.0,  # output: USD mn DV01; bp-vol reporting scaler
+    "Equity": 150.0, # output: USD mn notional
+    "FX": 120.0,     # output: USD mn notional
+}
+
+FX_ADV_USD_MN = {
+    "USD": 70_000.0,
+    "AUD": 45_000.0,
+    "EUR": 120_000.0,
+    "GBP": 55_000.0,
+    "JPY": 90_000.0,
+}
+
+POSITION_UNITS = {
+    "Rates": "USD mn DV01",
+    "Equity": "USD mn notional",
+    "FX": "USD mn notional",
+}
+
+
+def realized_pct_vol(price_df, window=CURRENT_VOL_WINDOW, floor=0.02):
+    vol = price_df.pct_change().rolling(window, min_periods=max(20, window // 2)).std() * np.sqrt(TRADING_DAYS)
+    return vol.clip(lower=floor)
+
+
+def build_rates_daily_bp_move_matrix(model_inputs_dict, price_index):
+    futures_df = model_inputs_dict.get("futures", pd.DataFrame())
+    rate_asset_map = {
+        key: asset
+        for key, asset in FUTURES_SIGNAL_ASSET_MAP.items()
+        if SIGNAL_ASSET_CLASS.get(asset) == "Rates"
+    }
+    required = {"date", "asset_key", "px1_clean", "dv01", "contractSize"}
+    if futures_df.empty:
+        raise ValueError("UBS-style rates bp volatility requires futures model inputs.")
+    missing = required - set(futures_df.columns)
+    if missing:
+        raise ValueError(f"UBS-style rates bp volatility requires missing columns: {sorted(missing)}")
+
+    tmp = futures_df.loc[
+        futures_df["asset_key"].isin(rate_asset_map),
+        ["date", "asset_key", "px1_clean", "dv01", "contractSize"],
+    ].copy()
+    tmp["date"] = pd.to_datetime(tmp["date"]).dt.normalize()
+    tmp["asset"] = tmp["asset_key"].map(rate_asset_map)
+
+    px = tmp.pivot_table(index="date", columns="asset", values="px1_clean", aggfunc="last").sort_index().astype(float)
+    dv01 = tmp.pivot_table(index="date", columns="asset", values="dv01", aggfunc="last").sort_index().astype(float)
+    contract_size = tmp.pivot_table(index="date", columns="asset", values="contractSize", aggfunc="last").sort_index().astype(float)
+
+    px = px.reindex(price_index).ffill()
+    dv01 = dv01.reindex(price_index).ffill()
+    contract_size = contract_size.reindex(price_index).ffill()
+
+    # Bloomberg bond futures prices are quoted per 100 notional. A one-day price
+    # change maps to local-currency contract PnL as contractSize * dPrice / 100.
+    # Dividing by the contract DV01 converts that price move into an implied bp move.
+    daily_contract_pnl = px.diff() * contract_size / 100.0
+    return daily_contract_pnl.divide(dv01.where(dv01 > 0))
+
+
+def build_rates_bp_vol_matrix(model_inputs_dict, price_index, window=CURRENT_VOL_WINDOW, floor=1.0):
+    daily_bp_move = build_rates_daily_bp_move_matrix(model_inputs_dict, price_index)
+    vol = daily_bp_move.rolling(window, min_periods=max(20, window // 2)).std() * np.sqrt(TRADING_DAYS)
+    return vol.clip(lower=floor)
+
+
+def rate_assets_in_columns(columns):
+    rate_assets = [asset for asset, cls in SIGNAL_ASSET_CLASS.items() if cls == "Rates"]
+    return [asset for asset in rate_assets if asset in columns]
+
+
+def build_current_vol_matrix(model_inputs_dict, price_df, window=CURRENT_VOL_WINDOW):
+    vol = realized_pct_vol(price_df, window=window)
+    rates_bp_vol = build_rates_bp_vol_matrix(model_inputs_dict, price_df.index, window=window)
+    rate_assets = [asset for asset in rate_assets_in_columns(vol.columns) if asset in rates_bp_vol.columns]
+    vol.loc[:, rate_assets] = rates_bp_vol.reindex(index=vol.index, columns=rate_assets)
+    return vol
+
+
+def build_risk_move_matrix(model_inputs_dict, price_df):
+    risk_moves = price_df.pct_change()
+    rates_bp_move = build_rates_daily_bp_move_matrix(model_inputs_dict, price_df.index)
+    rate_assets = [asset for asset in rate_assets_in_columns(risk_moves.columns) if asset in rates_bp_move.columns]
+    risk_moves.loc[:, rate_assets] = rates_bp_move.reindex(index=risk_moves.index, columns=rate_assets)
+    return risk_moves
+
+
+VOL_UNITS = {
+    "Rates": "annualized bp",
+    "Equity": "annualized decimal",
+    "FX": "annualized decimal",
+}
+
+
+def pivot_futures_field(model_inputs_dict, field, asset_map):
+    futures_df = model_inputs_dict.get("futures", pd.DataFrame())
+    if futures_df.empty or field not in futures_df.columns:
+        return pd.DataFrame(index=cta_signal_prices.index)
+
+    tmp = futures_df.loc[futures_df["asset_key"].isin(asset_map), ["date", "asset_key", field]].copy()
+    tmp["date"] = pd.to_datetime(tmp["date"]).dt.normalize()
+    tmp["asset"] = tmp["asset_key"].map(asset_map)
+
+    wide = (
+        tmp.pivot_table(index="date", columns="asset", values=field, aggfunc="last")
+        .sort_index()
+        .astype(float)
+    )
+    wide.columns.name = None
+    return wide.reindex(cta_signal_prices.index).ffill()
+
+
+def futures_currency_map(model_inputs_dict, asset_map):
+    futures_df = model_inputs_dict.get("futures", pd.DataFrame())
+    if futures_df.empty or "currency" not in futures_df.columns:
+        return {}
+
+    tmp = futures_df.loc[futures_df["asset_key"].isin(asset_map), ["asset_key", "currency"]].drop_duplicates("asset_key")
+    tmp["asset"] = tmp["asset_key"].map(asset_map)
+    return tmp.set_index("asset")["currency"].to_dict()
+
+
+def build_currency_to_usd_matrix(model_inputs_dict, index):
+    fx_df = model_inputs_dict.get("fx", pd.DataFrame())
+    currency_to_usd = pd.DataFrame(index=index)
+    currency_to_usd["USD"] = 1.0
+
+    if fx_df.empty:
+        return currency_to_usd
+
+    available = set(fx_df["asset_key"].dropna().unique())
+    conversion_keys = [key for key in ["AUD", "EUR", "GBP", "JPY"] if key in available]
+    if not conversion_keys:
+        return currency_to_usd
+
+    tmp = fx_df.loc[fx_df["asset_key"].isin(conversion_keys), ["date", "asset_key", "price_clean"]].copy()
+    tmp["date"] = pd.to_datetime(tmp["date"]).dt.normalize()
+
+    fx_wide = (
+        tmp.pivot_table(index="date", columns="asset_key", values="price_clean", aggfunc="last")
+        .sort_index()
+        .astype(float)
+    )
+    fx_wide.columns.name = None
+
+    currency_to_usd = currency_to_usd.join(fx_wide, how="left")
+    return currency_to_usd.reindex(index).ffill()
+
+
+def apply_currency_to_usd(df, currency_by_asset, currency_to_usd):
+    out = df.copy()
+    needed = {currency_by_asset.get(asset, "USD") for asset in out.columns}
+    missing = sorted(currency for currency in needed if currency not in currency_to_usd.columns)
+    if missing:
+        raise ValueError(f"Missing FX conversion data for currencies: {missing}")
+
+    for asset in out.columns:
+        currency = currency_by_asset.get(asset, "USD")
+        out[asset] = out[asset] * currency_to_usd[currency].reindex(out.index).ffill()
+    return out
+
+
+def build_adv_matrix(model_inputs_dict):
+    currency_by_asset = futures_currency_map(model_inputs_dict, FUTURES_SIGNAL_ASSET_MAP)
+    currency_to_usd = build_currency_to_usd_matrix(model_inputs_dict, cta_signal_prices.index)
+
+    rates_assets = [asset for asset, cls in SIGNAL_ASSET_CLASS.items() if cls == "Rates"]
+    equity_assets = [asset for asset, cls in SIGNAL_ASSET_CLASS.items() if cls == "Equity"]
+    fx_assets = [asset for asset, cls in SIGNAL_ASSET_CLASS.items() if cls == "FX"]
+
+    # Futures pipeline fields are daily traded amounts. Use a 63d average to match ADV.
+    rates_adv = pivot_futures_field(model_inputs_dict, "adjustedVolDV01Mm", FUTURES_SIGNAL_ASSET_MAP)
+    rates_adv = apply_currency_to_usd(rates_adv.reindex(columns=rates_assets), currency_by_asset, currency_to_usd)
+    rates_adv = rates_adv.rolling(63, min_periods=20).mean()
+
+    equity_adv = pivot_futures_field(model_inputs_dict, "adjustedVolNotionalBn", FUTURES_SIGNAL_ASSET_MAP)
+    equity_adv = apply_currency_to_usd(equity_adv.reindex(columns=equity_assets) * 1000.0, currency_by_asset, currency_to_usd)
+    equity_adv = equity_adv.rolling(63, min_periods=20).mean()
+
+    fx_adv = pd.DataFrame(index=cta_signal_prices.index)
+    for asset in fx_assets:
+        fx_adv[asset] = FX_ADV_USD_MN.get(asset, np.nan)
+
+    adv = pd.concat([rates_adv, equity_adv, fx_adv], axis=1, join="outer", sort=False)
+    return adv.reindex(index=cta_signal_prices.index, columns=cta_signals.columns).ffill()
+
+
+def build_oi_capacity_matrix(model_inputs_dict):
+    currency_by_asset = futures_currency_map(model_inputs_dict, FUTURES_SIGNAL_ASSET_MAP)
+    currency_to_usd = build_currency_to_usd_matrix(model_inputs_dict, cta_signal_prices.index)
+
+    rates_assets = [asset for asset, cls in SIGNAL_ASSET_CLASS.items() if cls == "Rates"]
+    equity_assets = [asset for asset, cls in SIGNAL_ASSET_CLASS.items() if cls == "Equity"]
+
+    rates_oi = pivot_futures_field(model_inputs_dict, "oiStateDV01Mm", FUTURES_SIGNAL_ASSET_MAP)
+    rates_oi = apply_currency_to_usd(rates_oi.reindex(columns=rates_assets), currency_by_asset, currency_to_usd)
+
+    equity_oi = pivot_futures_field(model_inputs_dict, "oiStateNotionalBn", FUTURES_SIGNAL_ASSET_MAP)
+    equity_oi = apply_currency_to_usd(equity_oi.reindex(columns=equity_assets) * 1000.0, currency_by_asset, currency_to_usd)
+
+    oi_capacity = pd.concat([rates_oi, equity_oi], axis=1, join="outer", sort=False)
+    return oi_capacity.reindex(index=cta_signal_prices.index, columns=cta_signals.columns).ffill()
+
+
+def cross_sectional_log_rank(series):
+    values = pd.to_numeric(series, errors="coerce")
+    values = values.where(values > 0)
+    valid = np.log(values.dropna())
+    if len(valid) <= 1:
+        return pd.Series(0.5, index=series.index)
+
+    raw_rank = valid.rank(method="average")
+    scaled_rank = (raw_rank - 1.0) / (len(valid) - 1.0)
+    return scaled_rank.reindex(series.index).fillna(0.5)
+
+
+def estimate_liquidity_factors(model_inputs_dict, adv_matrix, asof_date):
+    oi_capacity = build_oi_capacity_matrix(model_inputs_dict)
+    asset_class = pd.Series(SIGNAL_ASSET_CLASS)
+    fx_assets = asset_class.index[asset_class.eq("FX")].tolist()
+
+    all_adv_level = adv_matrix.loc[:asof_date].tail(21).median()
+    all_oi_level = oi_capacity.loc[:asof_date].tail(21).median()
+
+    factor_parts = []
+    diagnostic_parts = []
+
+    for class_name in ["Rates", "Equity"]:
+        class_assets = asset_class.index[asset_class.eq(class_name)].tolist()
+        adv_level = all_adv_level.reindex(class_assets)
+        oi_level = all_oi_level.reindex(class_assets)
+
+        # Units differ across asset classes: Rates uses USD mn DV01, Equity uses USD mn notional.
+        # Therefore liquidity ranks are computed within each asset class.
+        adv_score = cross_sectional_log_rank(adv_level)
+        oi_score = cross_sectional_log_rank(oi_level)
+        combined_score = (
+            LIQUIDITY_SCORE_WEIGHTS["adv"] * adv_score
+            + LIQUIDITY_SCORE_WEIGHTS["oi"] * oi_score
+        )
+        class_factor = (1 + 7 * combined_score).round().clip(1, 8)
+        factor_parts.append(class_factor)
+
+        amount_unit = "USD mn DV01" if class_name == "Rates" else "USD mn notional"
+        diagnostic_parts.append(pd.DataFrame({
+            "asset_class": class_name,
+            "amount_unit": amount_unit,
+            "adv_amount_level": adv_level,
+            "oi_amount_level": oi_level,
+            "adv_score": adv_score,
+            "oi_score": oi_score,
+            "combined_score": combined_score,
+            "liquidity_factor": class_factor,
+            "liquidity_source": f"{class_name} ADV/OI rank",
+        }))
+
+    fx_factor = pd.Series(FX_LIQUIDITY_FACTORS, dtype=float).reindex(fx_assets)
+    factor_parts.append(fx_factor)
+    diagnostic_parts.append(pd.DataFrame({
+        "asset_class": "FX",
+        "amount_unit": "USD mn notional",
+        "adv_amount_level": pd.Series(FX_ADV_USD_MN, dtype=float).reindex(fx_assets),
+        "oi_amount_level": np.nan,
+        "adv_score": np.nan,
+        "oi_score": np.nan,
+        "combined_score": np.nan,
+        "liquidity_factor": fx_factor,
+        "liquidity_source": "FX assumption",
+    }))
+
+    liquidity_factors = pd.concat(factor_parts).reindex(cta_signals.columns).fillna(4.0).astype(float)
+    diagnostics = pd.concat(diagnostic_parts).reindex(cta_signals.columns)
+    diagnostics["liquidity_factor"] = liquidity_factors
+    diagnostics["ubs_rates_factor"] = pd.Series(UBS_RATES_LIQUIDITY_FACTORS, dtype=float).reindex(cta_signals.columns)
+    diagnostics["factor_vs_ubs"] = diagnostics["liquidity_factor"] - diagnostics["ubs_rates_factor"]
+
+    return liquidity_factors, diagnostics
+
+
+def compute_portfolio_scaling(signal_df, vol_df, risk_move_df, liquidity_factors):
+    liq = liquidity_factors.reindex(signal_df.columns).astype(float)
+    acw = pd.Series(SIGNAL_ASSET_CLASS).map(ASSET_CLASS_WEIGHTS).reindex(signal_df.columns).astype(float)
+
+    raw_weight = signal_df.multiply(liq * acw, axis=1).divide(vol_df)
+    raw_weight = raw_weight.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    proxy_weight = raw_weight.div(raw_weight.abs().sum(axis=1).replace(0, np.nan), axis=0).fillna(0.0)
+
+    proxy_return = (proxy_weight.shift(1) * risk_move_df.fillna(0.0)).sum(axis=1)
+    realized = proxy_return.rolling(PORTFOLIO_VOL_WINDOW, min_periods=252).std() * np.sqrt(TRADING_DAYS)
+    scaling = TARGET_PORTFOLIO_VOL / realized.replace(0, np.nan)
+    return scaling.replace([np.inf, -np.inf], np.nan).clip(0.25, 4.0).ffill().fillna(1.0)
+
+
+def compute_cta_positions(signal_df, vol_df, portfolio_scaling, liquidity_factors):
+    liq = liquidity_factors.reindex(signal_df.columns).astype(float)
+    asset_class = pd.Series(SIGNAL_ASSET_CLASS).reindex(signal_df.columns)
+    acw = asset_class.map(ASSET_CLASS_WEIGHTS).astype(float)
+    scaler = asset_class.map(UNIT_SCALERS).astype(float)
+
+    positions = signal_df.multiply(liq * acw * scaler, axis=1).divide(vol_df)
+    positions = positions.multiply(portfolio_scaling, axis=0)
+    return positions.replace([np.inf, -np.inf], np.nan)
+
+
+cta_vol_3m = build_current_vol_matrix(model_inputs_for_signal, cta_signal_prices)
+cta_risk_moves = build_risk_move_matrix(model_inputs_for_signal, cta_signal_prices)
+cta_adv = build_adv_matrix(model_inputs_for_signal)
+liquidity_asof_date = cta_signals.dropna(how="all").index[-1]
+cta_liquidity_factors, cta_liquidity_diagnostics = estimate_liquidity_factors(
+    model_inputs_for_signal,
+    cta_adv,
+    liquidity_asof_date,
+)
+cta_portfolio_scaling = compute_portfolio_scaling(
+    cta_signals,
+    cta_vol_3m,
+    cta_risk_moves,
+    cta_liquidity_factors,
+)
+cta_positions = compute_cta_positions(
+    cta_signals,
+    cta_vol_3m,
+    cta_portfolio_scaling,
+    cta_liquidity_factors,
+)
+
+current_date = cta_positions.dropna(how="all").index[-1]
+comparison_loc = max(0, cta_positions.index.get_loc(current_date) - FLOW_LOOKBACK_DAYS)
+comparison_date = cta_positions.index[comparison_loc]
+
+current_position = cta_positions.loc[current_date]
+past_position = cta_positions.loc[comparison_date]
+flow_2w = current_position - past_position
+current_adv = cta_adv.loc[current_date]
+
+asset_class = pd.Series(SIGNAL_ASSET_CLASS).reindex(cta_positions.columns)
+cta_current_positioning = pd.DataFrame({
+    "asset_class": asset_class,
+    "signal": cta_signals.loc[current_date],
+    "vol_3m": cta_vol_3m.loc[current_date],
+    "vol_unit": asset_class.map(VOL_UNITS),
+    "liquidity_factor": cta_liquidity_factors.reindex(cta_positions.columns),
+    "liquidity_source": cta_liquidity_diagnostics["liquidity_source"].reindex(cta_positions.columns),
+    "asset_class_weight": asset_class.map(ASSET_CLASS_WEIGHTS),
+    "position": current_position,
+    "position_unit": asset_class.map(POSITION_UNITS),
+    "adv_same_unit": current_adv,
+    "position_%ADV": current_position / current_adv * 100,
+    "flow_2w": flow_2w,
+    "flow_2w_%ADV": flow_2w / current_adv * 100,
+    "portfolio_scaling": cta_portfolio_scaling.loc[current_date],
+}).sort_values("position_%ADV", key=lambda s: s.abs(), ascending=False)
+
+print(f"Current date: {current_date.date()} | 2w comparison date: {comparison_date.date()}")
+display(cta_current_positioning)
+display(cta_liquidity_diagnostics.sort_values("liquidity_factor", ascending=False))
