@@ -1,0 +1,62 @@
+## Carry Consideration
+
+Carry should determine **whether surplus CNY/INR cash is retained locally or repatriated**, rather than whether the FX exposure itself should be hedged.
+
+Once cash is confirmed to be surplus to local operating needs, Treasury has two choices:
+
+* **Repatriate now:** convert CNY/INR into EUR and use the EUR to invest or repay debt.
+* **Retain locally and hedge:** keep the cash in CNY/INR, earn the local yield, and use a forward/NDF to lock its future EUR value.
+
+The decision should be based on:
+
+> **Local investment yield + forward benefit/cost vs. EUR opportunity cost**
+
+### 1Y Forward Comparison
+
+Using the 1W level as a proxy for spot:
+
+|                  |            EURCNY |         EURINR |
+| ---------------- | ----------------: | -------------: |
+| Spot proxy       |          **7.80** |      **110.7** |
+| 1Y Forward / NDF |          **7.70** |      **115.5** |
+| Forward impact   | **~1.3% benefit** | **~4.3% cost** |
+
+For **CNY**, the lower local yield is partly compensated by the roughly **1.3% forward benefit**. Retaining CNY can therefore make sense if the local yield plus this benefit exceeds the EUR opportunity cost.
+
+For **INR**, the higher local yield is offset by roughly **4.3% of forward cost**. Treasury should therefore retain INR only if the local yield is high enough to overcome both the EUR opportunity cost and the expensive forward.
+
+### Simple Example
+
+Assume the EUR opportunity cost is **2.5%**:
+
+* **CNY:** local yield **1.5%** + forward benefit **1.3%** ≈ **2.8%** → slightly better than repatriating.
+* **INR:** local yield **6.5%** − forward cost **4.3%** ≈ **2.2%** → slightly worse than repatriating.
+
+### Key Takeaway
+
+**Higher local interest rates do not automatically mean better carry.**
+
+At current 1Y levels, retaining CNY appears relatively more attractive because of favourable forward points, while INR needs a sufficiently high local yield to offset its expensive forward.
+
+The final decision should also consider **tax, transaction costs, liquidity needs and repatriation restrictions**.
+
+
+## Overall Key Takeaway
+
+We recommend a **rolling and layered hedge programme** for both CNY and INR revenues, with hedge ratios and instruments determined by cash-flow visibility.
+
+* **Near-term, highly certain cash flows should be hedged more heavily.** As receipt and repatriation dates are known, Treasury should favour **deliverable forwards**, selling CNY/INR and buying EUR with maturities matched to the expected cash flows.
+
+* **Longer-dated forecast revenues should be hedged more selectively.** As cash-flow uncertainty increases, hedge ratios should decline. **NDFs can be used for the more probable portion of forecast exposure** where Treasury wants to protect the EUR value but physical conversion or repatriation timing is not yet certain. As the cash flow crystallises, the hedge can progressively move towards a DF.
+
+* **INR should carry a higher hedge ratio than CNY at each horizon.** INR is more exposed to oil and global risk-off shocks, while a lower CNY hedge ratio retains some participation in potential CNY appreciation.
+
+* **Carry determines when surplus cash should be repatriated, not whether the FX exposure should be hedged.** At 1Y, EURCNY provides roughly a **1.3% forward benefit**, while EURINR carries around a **4.3% forward cost**. Treasury should retain local cash only when the local investment return after forward points exceeds the EUR opportunity cost.
+
+### In Practice
+
+**CNY:** Lower hedge ratio → partial long-dated NDF → increase hedge as visibility improves → DF for confirmed repatriation.
+
+**INR:** Higher hedge ratio → hedge forecast exposure earlier → increase towards near-full hedging as cash flows crystallise → DF for confirmed repatriation.
+
+**Overall objective: protect the EUR value of CNY and INR revenues without over-hedging uncertain long-term cash flows.**
